@@ -12,4 +12,5 @@ export interface Dimensions {
   itemsPerRow: number;
   itemsPerCol: number;
   itemsPerRowByCalc: number;
+  scrollHeight: number;
 }

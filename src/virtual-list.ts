@@ -1,3 +1,4 @@
+import { Renderer2 } from '@angular/core';
 /**
  * @license VirtualList v0.2.3
  * Based on Angular2-Virtual-Scroll: https://github.com/rintoj/angular2-virtual-scroll
@@ -19,6 +20,8 @@ import {
   QueryList,
   SimpleChanges,
   ViewChild,
+  OnInit,
+  NgZone
 } from '@angular/core';
 import 'rxjs/add/operator/filter';
 import 'rxjs/add/operator/takeUntil';
@@ -36,8 +39,8 @@ const DEFAULT_VISIBLE_CHILDREN = 6;
   selector: 'virtual-list',
   moduleId: 'angularVirtualList',
   template: `
-    <div class="total-padding" [style.height.px]="scrollHeight"></div>
-    <div class="list-content" #content [style.transform]="'translateY(' + topPadding + 'px)'">
+    <div class="total-padding" #shim></div>
+    <div class="list-content" #content >
       <ng-content></ng-content>
     </div>
   `,
@@ -61,7 +64,7 @@ const DEFAULT_VISIBLE_CHILDREN = 6;
     }
   `],
 })
-export class VirtualListComponent<T = any> implements OnChanges, OnDestroy {
+export class VirtualListComponent<T = any> implements OnChanges, OnInit, OnDestroy {
 
   topPadding: number;
   scrollHeight: number;
@@ -71,6 +74,17 @@ export class VirtualListComponent<T = any> implements OnChanges, OnDestroy {
   protected element: HTMLElement;
   protected storedItems: T[];
   protected itemsSubscription: Subscription;
+
+  private _parentScroll: Element | Window;
+  private disposeScrollHandler: () => void | undefined;
+  private disposeResizeHandler: () => void | undefined;
+  private refreshHandler = () => {
+    this.refresh();
+  };
+
+   /** Cache of the last scroll height to prevent setting CSS when not needed. */
+   private lastScrollHeight = -1;
+
 
   @Input()
   height: string;
@@ -108,6 +122,23 @@ export class VirtualListComponent<T = any> implements OnChanges, OnDestroy {
   @HostBinding('style.height')
   heightStyle = '';
 
+  @ViewChild('shim', { read: ElementRef })
+  shimElementRef: ElementRef;
+
+
+  @Input()
+  set parentScroll(element: Element | Window) {
+    if (this._parentScroll === element) {
+      return;
+    }
+    this._parentScroll = element;
+    this.addParentEventHandlers(this._parentScroll);
+  }
+
+  get parentScroll(): Element | Window {
+    return this._parentScroll;
+  }
+
   @Input()
   set source$(items$: Observable<T[]>) {
     if (items$ instanceof Observable) {
@@ -137,8 +168,17 @@ export class VirtualListComponent<T = any> implements OnChanges, OnDestroy {
     }
   }
 
-  constructor(element: ElementRef) {
+  constructor(
+    private readonly zone: NgZone,
+    private readonly renderer: Renderer2,     
+    element: ElementRef) {
     this.element = element.nativeElement;
+  }
+
+  ngOnInit() {
+    if (!this.parentScroll) {
+      this.addParentEventHandlers(this.element);
+    }
   }
 
   protected hasItems(): boolean {
@@ -193,6 +233,32 @@ export class VirtualListComponent<T = any> implements OnChanges, OnDestroy {
     return false;
   }
 
+
+  private addParentEventHandlers(parentScroll: Element | Window) {
+    this.removeParentEventHandlers();
+    if (parentScroll) {
+      this.zone.runOutsideAngular(() => {
+        this.disposeScrollHandler =
+          this.renderer.listen(parentScroll, 'scroll', this.refreshHandler);
+        if (parentScroll instanceof Window) {
+          this.disposeScrollHandler =
+            this.renderer.listen('window', 'resize', this.refreshHandler);
+        }
+      });
+    }
+  }
+
+  private removeParentEventHandlers() {
+    if (this.disposeScrollHandler) {
+      this.disposeScrollHandler();
+      this.disposeScrollHandler = undefined;
+    }
+    if (this.disposeResizeHandler) {
+      this.disposeResizeHandler();
+      this.disposeResizeHandler = undefined;
+    }
+  }
+
   protected countItemsPerRow() {
     let offsetTop;
     let itemsPerRow;
@@ -207,7 +273,7 @@ export class VirtualListComponent<T = any> implements OnChanges, OnDestroy {
   }
 
   protected calculateDimensions(): Dimensions {
-    const el = this.element;
+    let el: Element = this.parentScroll instanceof Window ? document.body : this.parentScroll || this.element.nativeElement;
     const content = this.contentElementRef.nativeElement;
 
     const items = this.getItems();
@@ -241,8 +307,14 @@ export class VirtualListComponent<T = any> implements OnChanges, OnDestroy {
     const itemsPerRowByCalc = Math.max(1, Math.floor(viewWidth / childWidth));
     const itemsPerCol = Math.max(1, Math.floor(viewHeight / childHeight));
     const scrollTop = Math.max(0, el.scrollTop);
+    const scrollHeight = childHeight * Math.ceil(itemCount / itemsPerRow);
     if (itemsPerCol === 1 && Math.floor(scrollTop / this.scrollHeight * itemCount) + itemsPerRowByCalc >= itemCount) {
       itemsPerRow = itemsPerRowByCalc;
+    }
+
+    if (scrollHeight !== this.lastScrollHeight) {
+      this.renderer.setStyle(this.shimElementRef.nativeElement, 'height', `${scrollHeight}px`);
+      this.lastScrollHeight = scrollHeight;
     }
 
     return {
@@ -253,18 +325,21 @@ export class VirtualListComponent<T = any> implements OnChanges, OnDestroy {
       childHeight: childHeight,
       itemsPerRow: itemsPerRow,
       itemsPerCol: itemsPerCol,
-      itemsPerRowByCalc: itemsPerRowByCalc
+      itemsPerRowByCalc: itemsPerRowByCalc,
+      scrollHeight
     };
   }
 
-  protected calculateItems() {
-    const el = this.element;
+  protected calculateItems(forceViewportUpdate: boolean = false) {
+    const el = this.parentScroll instanceof Window ? document.body : this.parentScroll || this.element;
 
     let dimensions = this.calculateDimensions();
     const items = this.getItems();
     if (this.setHeight(dimensions)) {
       dimensions = this.calculateDimensions();
     }
+    let offsetTop = this.getElementsOffset();
+
     this.scrollHeight = dimensions.childHeight * dimensions.itemCount / dimensions.itemsPerRow;
     if (this.element.scrollTop > this.scrollHeight) {
       this.element.scrollTop = this.scrollHeight;
@@ -325,6 +400,18 @@ export class VirtualListComponent<T = any> implements OnChanges, OnDestroy {
     requestAnimationFrame(() => this.calculateItems());
   }
 
+  
+  private getElementsOffset(): number {
+    let offsetTop = 0;
+    if (this.containerElementRef && this.containerElementRef.nativeElement) {
+      offsetTop += this.containerElementRef.nativeElement.offsetTop;
+    }
+    if (this.parentScroll) {
+      offsetTop += this.element.nativeElement.offsetTop;
+    }
+    return offsetTop;
+  }
+
   scrollInto(item: T) {
     if (this.hasItems()) {
       const index: number = this.getItems().indexOf(item);
@@ -343,6 +430,13 @@ export class VirtualListComponent<T = any> implements OnChanges, OnDestroy {
     this.refreshList();
   }
 
+  refresh(forceViewportUpdate: boolean = false) {
+    this.zone.runOutsideAngular(() => {
+      requestAnimationFrame(() => this.calculateItems(forceViewportUpdate));
+    });
+  }
+
+
   ngOnChanges(changes: SimpleChanges) {
     const { visibleChildren } = changes;
 
@@ -357,5 +451,6 @@ export class VirtualListComponent<T = any> implements OnChanges, OnDestroy {
     if (this.itemsSubscription instanceof Subscription) {
       this.itemsSubscription.unsubscribe();
     }
+    this.removeParentEventHandlers();
   }
 }
